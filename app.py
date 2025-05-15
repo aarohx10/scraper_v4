@@ -37,7 +37,13 @@ async def research_company(query: SearchQuery):
         result = await scraper_main(query.query)
         
         # Clean and format the output
-        cleaned_result = clean_output(result)
+        if isinstance(result, list):
+            cleaned_result = [
+                clean_output(r["content"] if isinstance(r, dict) and "content" in r else str(r))
+                for r in result
+            ]
+        else:
+            cleaned_result = clean_output(result)
         
         return {
             "status": "success",
