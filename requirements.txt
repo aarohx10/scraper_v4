@@ -11,4 +11,6 @@ python-dotenv==1.0.0
 pydantic==2.4.2
 tldextract
 lxml
-tqdm 
+tqdm
+aiohttp
+aiofiles 

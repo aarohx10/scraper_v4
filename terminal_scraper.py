@@ -16,6 +16,12 @@ import openpyxl
 import pptx
 import tldextract
 from tqdm import tqdm
+import aiohttp
+import aiofiles
+from asyncio import Semaphore
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 def google_search_urls(query, num_results=20):
     """Scrape Google search results for a query using requests."""
@@ -260,6 +266,7 @@ def extract_text_from_pdf(path):
             for page in doc:
                 text += page.get_text()
     except Exception as e:
+        logging.error(f"PDF extraction error for {path}: {e}")
         text = f"[PDF extraction error: {e}]"
     return text
 
@@ -268,6 +275,7 @@ def extract_text_from_docx(path):
         doc = docx.Document(path)
         return '\n'.join([p.text for p in doc.paragraphs])
     except Exception as e:
+        logging.error(f"DOCX extraction error for {path}: {e}")
         return f"[DOCX extraction error: {e}]"
 
 def extract_text_from_xlsx(path):
@@ -279,6 +287,7 @@ def extract_text_from_xlsx(path):
                 text.append('\t'.join([str(cell) if cell is not None else '' for cell in row]))
         return '\n'.join(text)
     except Exception as e:
+        logging.error(f"XLSX extraction error for {path}: {e}")
         return f"[XLSX extraction error: {e}]"
 
 def extract_text_from_pptx(path):
@@ -291,6 +300,7 @@ def extract_text_from_pptx(path):
                     text.append(shape.text)
         return '\n'.join(text)
     except Exception as e:
+        logging.error(f"PPTX extraction error for {path}: {e}")
         return f"[PPTX extraction error: {e}]"
 
 def extract_text_from_txt(path):
@@ -298,6 +308,7 @@ def extract_text_from_txt(path):
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             return f.read()
     except Exception as e:
+        logging.error(f"TXT extraction error for {path}: {e}")
         return f"[TXT extraction error: {e}]"
 
 def download_file(url, dest_folder="downloads"):
@@ -311,6 +322,7 @@ def download_file(url, dest_folder="downloads"):
                 f.write(chunk)
         return local_filename
     except Exception as e:
+        logging.error(f"Exception downloading {url}: {e}")
         return None
 
 def extract_detailed_content(soup, url):
@@ -394,19 +406,119 @@ def process_documents(doc_links):
         docs.append({'url': url, 'local_path': local_path, 'content': text})
     return docs
 
+CONCURRENT_REQUESTS = 10
+
+async def fetch_page(session, url, sem):
+    async with sem:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with session.get(url, timeout=15, headers=headers) as resp:
+                if resp.status != 200:
+                    logging.warning(f"Failed to fetch {url}: status {resp.status}")
+                    return None
+                text = await resp.text()
+                return text
+        except Exception as e:
+            logging.error(f"Exception fetching {url}: {e}")
+            return None
+
+async def extract_detailed_content_async(session, url, sem):
+    html = await fetch_page(session, url, sem)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    return extract_detailed_content(soup, url)
+
+async def recursive_crawl_async(start_url, max_pages=30, max_depth=2):
+    visited = set()
+    to_visit = [(start_url, 0)]
+    domain = tldextract.extract(start_url).registered_domain
+    all_content = []
+    sem = Semaphore(CONCURRENT_REQUESTS)
+    async with aiohttp.ClientSession() as session:
+        while to_visit and len(visited) < max_pages:
+            batch = []
+            while to_visit and len(batch) < CONCURRENT_REQUESTS and len(visited) + len(batch) < max_pages:
+                url, depth = to_visit.pop(0)
+                if url in visited or depth > max_depth:
+                    continue
+                batch.append((url, depth))
+            tasks = [extract_detailed_content_async(session, url, sem) for url, _ in batch]
+            results = await asyncio.gather(*tasks)
+            for (url, depth), content in zip(batch, results):
+                if content:
+                    all_content.append(content)
+                    visited.add(url)
+                    # Find new links
+                    soup = BeautifulSoup(await fetch_page(session, url, sem), "lxml")
+                    for link in extract_links(soup, url):
+                        link_domain = tldextract.extract(link).registered_domain
+                        if link_domain == domain and link not in visited:
+                            to_visit.append((link, depth+1))
+    return all_content
+
+async def download_file_async(session, url, dest_folder="downloads", sem=None):
+    os.makedirs(dest_folder, exist_ok=True)
+    local_filename = os.path.join(dest_folder, os.path.basename(url.split('?')[0]))
+    try:
+        async with sem:
+            async with session.get(url, timeout=30) as resp:
+                if resp.status != 200:
+                    logging.warning(f"Failed to download {url}: status {resp.status}")
+                    return None
+                async with aiofiles.open(local_filename, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        await f.write(chunk)
+        return local_filename
+    except Exception as e:
+        logging.error(f"Exception downloading {url}: {e}")
+        return None
+
+async def process_documents_async(doc_links):
+    docs = []
+    sem = Semaphore(CONCURRENT_REQUESTS)
+    async with aiohttp.ClientSession() as session:
+        tasks = [download_file_async(session, url, sem=sem) for url in doc_links]
+        local_paths = await asyncio.gather(*tasks)
+    for url, local_path in zip(doc_links, local_paths):
+        if not local_path:
+            continue
+        ext = os.path.splitext(local_path)[1].lower()
+        if ext == '.pdf':
+            text = extract_text_from_pdf(local_path)
+        elif ext == '.docx':
+            text = extract_text_from_docx(local_path)
+        elif ext == '.xlsx':
+            text = extract_text_from_xlsx(local_path)
+        elif ext == '.pptx':
+            text = extract_text_from_pptx(local_path)
+        elif ext == '.txt':
+            text = extract_text_from_txt(local_path)
+        else:
+            text = '[Unknown document type]'
+        docs.append({'url': url, 'local_path': local_path, 'content': text})
+    return docs
+
 async def main(query):
     print(f"Starting comprehensive company research for: {query}")
     urls = google_search_urls(query, num_results=10)
     all_results = []
     for url in urls:
         print(f"\nRecursively crawling: {url}")
-        site_content = recursive_crawl(url, max_pages=30, max_depth=2)
+        site_content = await recursive_crawl_async(url, max_pages=30, max_depth=2)
         # Collect all document links from all pages
         doc_links = set()
         for page in site_content:
-            soup = BeautifulSoup(requests.get(page['url'], timeout=10).text, "lxml")
+            html = page.get('html') if 'html' in page else None
+            if not html:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        html = await fetch_page(session, page['url'], Semaphore(1))
+                except Exception:
+                    continue
+            soup = BeautifulSoup(html, "lxml")
             doc_links.update(extract_documents(soup, page['url']))
-        documents = process_documents(doc_links)
+        documents = await process_documents_async(list(doc_links))
         all_results.append({'site': url, 'pages': site_content, 'documents': documents})
     print("\nResearch completed. Returning all detailed data.")
     return all_results
