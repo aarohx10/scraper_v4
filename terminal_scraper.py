@@ -8,6 +8,14 @@ import time
 import random
 import sys
 import socket
+import os
+import mimetypes
+import fitz  # PyMuPDF
+import docx
+import openpyxl
+import pptx
+import tldextract
+from tqdm import tqdm
 
 def google_search_urls(query, num_results=20):
     """Scrape Google search results for a query using requests."""
@@ -218,36 +226,190 @@ async def process_url(url):
         "content": page_text  # No character limit here
     }
 
+def extract_emails(text):
+    return re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
+
+def extract_phones(text):
+    return re.findall(r"\+?\d[\d\s().-]{7,}\d", text)
+
+def extract_links(soup, base_url):
+    links = set()
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if href.startswith('http'):
+            links.add(href)
+        elif href.startswith('/'):
+            links.add(urljoin(base_url, href))
+    return links
+
+def extract_documents(soup, base_url):
+    doc_links = set()
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if any(href.lower().endswith(ext) for ext in ['.pdf', '.docx', '.xlsx', '.pptx', '.txt']):
+            if href.startswith('http'):
+                doc_links.add(href)
+            elif href.startswith('/'):
+                doc_links.add(urljoin(base_url, href))
+    return doc_links
+
+def extract_text_from_pdf(path):
+    text = ""
+    try:
+        with fitz.open(path) as doc:
+            for page in doc:
+                text += page.get_text()
+    except Exception as e:
+        text = f"[PDF extraction error: {e}]"
+    return text
+
+def extract_text_from_docx(path):
+    try:
+        doc = docx.Document(path)
+        return '\n'.join([p.text for p in doc.paragraphs])
+    except Exception as e:
+        return f"[DOCX extraction error: {e}]"
+
+def extract_text_from_xlsx(path):
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        text = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                text.append('\t'.join([str(cell) if cell is not None else '' for cell in row]))
+        return '\n'.join(text)
+    except Exception as e:
+        return f"[XLSX extraction error: {e}]"
+
+def extract_text_from_pptx(path):
+    try:
+        prs = pptx.Presentation(path)
+        text = []
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    text.append(shape.text)
+        return '\n'.join(text)
+    except Exception as e:
+        return f"[PPTX extraction error: {e}]"
+
+def extract_text_from_txt(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+    except Exception as e:
+        return f"[TXT extraction error: {e}]"
+
+def download_file(url, dest_folder="downloads"):
+    os.makedirs(dest_folder, exist_ok=True)
+    local_filename = os.path.join(dest_folder, os.path.basename(url.split('?')[0]))
+    try:
+        r = requests.get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        with open(local_filename, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return local_filename
+    except Exception as e:
+        return None
+
+def extract_detailed_content(soup, url):
+    content = {}
+    content['url'] = url
+    content['title'] = soup.title.string if soup.title else "No title"
+    content['meta_description'] = ''
+    meta_tag = soup.find("meta", attrs={"name": "description"})
+    if meta_tag and meta_tag.get("content"):
+        content['meta_description'] = meta_tag["content"]
+    content['headings'] = {f"h{i}": [h.get_text(strip=True) for h in soup.find_all(f"h{i}")] for i in range(1,7)}
+    content['paragraphs'] = [p.get_text(strip=True) for p in soup.find_all('p') if p.get_text(strip=True)]
+    content['tables'] = []
+    for table in soup.find_all('table'):
+        rows = []
+        for tr in table.find_all('tr'):
+            cells = [td.get_text(strip=True) for td in tr.find_all(['td','th'])]
+            if cells:
+                rows.append(cells)
+        if rows:
+            content['tables'].append(rows)
+    content['lists'] = []
+    for ul in soup.find_all(['ul','ol']):
+        items = [li.get_text(strip=True) for li in ul.find_all('li')]
+        if items:
+            content['lists'].append(items)
+    content['images'] = [{'src': img.get('src'), 'alt': img.get('alt','')} for img in soup.find_all('img')]
+    page_text = soup.get_text(separator="\n", strip=True)
+    content['emails'] = extract_emails(page_text)
+    content['phones'] = extract_phones(page_text)
+    content['links'] = list(extract_links(soup, url))
+    return content
+
+def recursive_crawl(start_url, max_pages=30, max_depth=2):
+    visited = set()
+    to_visit = [(start_url, 0)]
+    domain = tldextract.extract(start_url).registered_domain
+    all_content = []
+    with tqdm(total=max_pages, desc=f"Crawling {start_url}") as pbar:
+        while to_visit and len(visited) < max_pages:
+            url, depth = to_visit.pop(0)
+            if url in visited or depth > max_depth:
+                continue
+            try:
+                response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                if response.status_code != 200:
+                    continue
+                soup = BeautifulSoup(response.text, "lxml")
+                content = extract_detailed_content(soup, url)
+                all_content.append(content)
+                visited.add(url)
+                pbar.update(1)
+                # Find new links
+                for link in extract_links(soup, url):
+                    link_domain = tldextract.extract(link).registered_domain
+                    if link_domain == domain and link not in visited:
+                        to_visit.append((link, depth+1))
+            except Exception as e:
+                continue
+    return all_content
+
+def process_documents(doc_links):
+    docs = []
+    for url in tqdm(doc_links, desc="Downloading documents"):
+        local_path = download_file(url)
+        if not local_path:
+            continue
+        ext = os.path.splitext(local_path)[1].lower()
+        if ext == '.pdf':
+            text = extract_text_from_pdf(local_path)
+        elif ext == '.docx':
+            text = extract_text_from_docx(local_path)
+        elif ext == '.xlsx':
+            text = extract_text_from_xlsx(local_path)
+        elif ext == '.pptx':
+            text = extract_text_from_pptx(local_path)
+        elif ext == '.txt':
+            text = extract_text_from_txt(local_path)
+        else:
+            text = '[Unknown document type]'
+        docs.append({'url': url, 'local_path': local_path, 'content': text})
+    return docs
+
 async def main(query):
-    """Main function to run the scraper and print detailed results to terminal."""
     print(f"Starting comprehensive company research for: {query}")
-    
-    # Get URLs for the company
-    urls = google_search_urls(query, num_results=20)
-    
-    print(f"Found {len(urls)} URLs to process")
-    
-    # Process each URL
-    tasks = [process_url(url) for url in urls]
-    results = await asyncio.gather(*tasks)
-    
-    # Filter out empty results or error messages only
-    results = [r for r in results if r["content"] and not r["content"].startswith("[Could not") and len(r["content"]) > 200]
-    
-    # Print full detailed results to terminal
-    print("\n" + "=" * 100)
-    print(f"COMPREHENSIVE DATA FOR: {query}")
-    print("=" * 100 + "\n")
-    
-    for i, result in enumerate(results, 1):
-        print(f"DETAILED SOURCE {i}/{len(results)}: {result['url']}")
-        print("=" * 100)
-        print(result['content'])
-        print("\n" + "=" * 100 + "\n")
-    
-    print(f"Research completed. Found detailed information from {len(results)} sources.")
-    
-    return results
+    urls = google_search_urls(query, num_results=10)
+    all_results = []
+    for url in urls:
+        print(f"\nRecursively crawling: {url}")
+        site_content = recursive_crawl(url, max_pages=30, max_depth=2)
+        # Collect all document links from all pages
+        doc_links = set()
+        for page in site_content:
+            soup = BeautifulSoup(requests.get(page['url'], timeout=10).text, "lxml")
+            doc_links.update(extract_documents(soup, page['url']))
+        documents = process_documents(doc_links)
+        all_results.append({'site': url, 'pages': site_content, 'documents': documents})
+    print("\nResearch completed. Returning all detailed data.")
+    return all_results
 
 if __name__ == "__main__":
     # If arguments provided, use them as query
