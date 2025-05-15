@@ -1,0 +1,14 @@
+[Unit]
+Description=Company Research API Service
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/root/company-research/scraper_v2
+Environment="PATH=/root/company-research/scraper_v2/venv/bin"
+ExecStart=/root/company-research/scraper_v2/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target 
